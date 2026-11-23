@@ -28,19 +28,40 @@ def _get_text(elem, tag_name: str, default: str = "") -> str:
     return default
 
 
-def _normalizar_sku(valor: str) -> str:
-    """Normaliza o SKU para comparação consistente (remove espaços e zeros à esquerda opcionais)."""
-    texto = str(valor).strip()
+def _normalizar_codigo(valor: str) -> str:
+    """Normaliza código SKU/EAN (remove espaços e zeros à esquerda opcionais)."""
+    if valor is None:
+        return ""
+    texto = str(valor).strip().upper()
+    if not texto or texto == "SEM GTIN":
+        return ""
     return texto.lstrip("0") or texto
 
 
-def processar_arquivo_xml(arquivo_xml, skus_monitorados_map: dict, cnpj_loja: str = ""):
+def _extrair_chaves_item(prod_elem) -> list[str]:
+    """
+    Coleta todos os códigos possíveis do item no XML (<cProd>, <cEAN>, <cEANTrib>)
+    para garantir o cruzamento tanto por SKU interno quanto por código de barras EAN.
+    """
+    candidatos = []
+    for tag in ("cProd", "cEAN", "cEANTrib"):
+        bruto = _get_text(prod_elem, tag)
+        if bruto and bruto.upper() != "SEM GTIN":
+            candidatos.append(bruto)
+            norm = _normalizar_codigo(bruto)
+            if norm and norm not in candidatos:
+                candidatos.append(norm)
+    return candidatos
+
+
+def processar_arquivo_xml(arquivo_xml, codigos_monitorados_map: dict, cnpj_loja: str = ""):
     """
     Lê um arquivo XML de NF-e (modelo 55) ou NFC-e (modelo 65) e extrai
-    as movimentações dos SKUs presentes na lista monitorada.
+    as movimentações dos itens presentes na lista monitorada.
     """
     movimentacoes = []
     try:
+        arquivo_xml.seek(0)
         conteudo = arquivo_xml.read()
         root = ET.fromstring(conteudo)
     except Exception as e:
@@ -75,6 +96,9 @@ def processar_arquivo_xml(arquivo_xml, skus_monitorados_map: dict, cnpj_loja: st
         else:
             tipo_mov = "Entrada" if (modelo == "55" and tp_nf == "1") else "Saída"
     else:
+        # Regra padrão para simulação sem CNPJ informado:
+        # NFC-e (65) -> Saída (venda no PDV)
+        # NF-e (55) -> Entrada (compra recebida de fornecedor)
         if modelo == "65":
             tipo_mov = "Entrada" if fin_nfe == "4" else "Saída"
         else:
@@ -88,16 +112,14 @@ def processar_arquivo_xml(arquivo_xml, skus_monitorados_map: dict, cnpj_loja: st
         if prod is None:
             continue
 
-        c_prod = _get_text(prod, "cProd")
-        sku_norm = _normalizar_sku(c_prod)
+        # Tenta cruzar por <cProd>, <cEAN> ou <cEANTrib>
+        chave_original_encontrada = None
+        for candidato in _extrair_chaves_item(prod):
+            if candidato in codigos_monitorados_map:
+                chave_original_encontrada = codigos_monitorados_map[candidato]
+                break
 
-        sku_chave_original = None
-        if c_prod in skus_monitorados_map:
-            sku_chave_original = c_prod
-        elif sku_norm in skus_monitorados_map:
-            sku_chave_original = skus_monitorados_map[sku_norm]
-
-        if not sku_chave_original:
+        if not chave_original_encontrada:
             continue
 
         try:
@@ -107,7 +129,7 @@ def processar_arquivo_xml(arquivo_xml, skus_monitorados_map: dict, cnpj_loja: st
 
         movimentacoes.append(
             {
-                "SKU": sku_chave_original,
+                "SKU": chave_original_encontrada,
                 "Tipo": tipo_mov,
                 "Quantidade": qtd,
             }
@@ -119,7 +141,7 @@ def processar_arquivo_xml(arquivo_xml, skus_monitorados_map: dict, cnpj_loja: st
 def renderizar_aba_xml():
     st.header("📄 Processamento de XMLs (NF-e 55 e NFC-e 65)")
     st.caption(
-        "Cruza a base de itens coletados (por SKU) com os XMLs de entrada e saída para consolidar o saldo."
+        "Cruza a base de itens coletados (por SKU ou EAN) com os XMLs de entrada e saída para consolidar o saldo."
     )
 
     # 1. Carregamento da base inicial de itens coletados (sessão atual ou upload de CSV)
@@ -154,6 +176,7 @@ def renderizar_aba_xml():
         )
         if arquivo_csv is not None:
             try:
+                arquivo_csv.seek(0)
                 conteudo_bytes = arquivo_csv.read()
                 texto_csv = conteudo_bytes.decode("utf-8-sig")
                 separador = ";" if ";" in texto_csv.splitlines()[0] else ","
@@ -164,7 +187,7 @@ def renderizar_aba_xml():
 
                 if "Qtd Física" in df_base.columns:
                     df_base["Qtd Física"] = (
-                        df_base["Qtd Física"].str.replace(",", ".").astype(float)
+                        df_base["Qtd Física"].astype(str).str.replace(",", ".").astype(float)
                     )
                 else:
                     df_base["Qtd Física"] = 0.0
@@ -177,13 +200,13 @@ def renderizar_aba_xml():
         return
 
     with st.expander("Visualizar SKUs monitorados", expanded=False):
-        st.dataframe(df_base, use_container_width=True)
+        st.table(df_base)
 
     # 2. Upload múltiplo dos arquivos XML
     st.subheader("2. Upload dos Arquivos XML (NF-e e NFC-e)")
     cnpj_loja = st.text_input(
         "CNPJ da Loja (opcional — ajuda a distinguir compras de vendas em NF-e modelo 55)",
-        placeholder="Ex: 12.345.678/0001-99 (deixe vazio para considerar NF-e 55 = Entrada e NFC-e 65 = Saída)",
+        placeholder="Ex: 11.111.111/0001-91 (deixe vazio para considerar NF-e 55 = Entrada e NFC-e 65 = Saída)",
     )
 
     arquivos_xml = st.file_uploader(
@@ -198,18 +221,20 @@ def renderizar_aba_xml():
 
     # 3. Processamento e consolidação
     if st.button("⚙️ Processar XMLs e Gerar Consolidado", type="primary", use_container_width=True):
-        skus_map = {}
+        codigos_map = {}
         for sku_val in df_base["SKU"].astype(str):
             sku_limpo = sku_val.strip()
-            skus_map[sku_limpo] = sku_limpo
-            skus_map[_normalizar_sku(sku_limpo)] = sku_limpo
+            codigos_map[sku_limpo] = sku_limpo
+            norm = _normalizar_codigo(sku_limpo)
+            if norm:
+                codigos_map[norm] = sku_limpo
 
         todas_movs = []
         avisos = []
 
         with st.spinner(f"Processando {len(arquivos_xml)} arquivo(s) XML..."):
             for arq in arquivos_xml:
-                movs, erro = processar_arquivo_xml(arq, skus_map, cnpj_loja)
+                movs, erro = processar_arquivo_xml(arq, codigos_map, cnpj_loja)
                 if erro:
                     avisos.append(erro)
                 todas_movs.extend(movs)
@@ -241,7 +266,10 @@ def renderizar_aba_xml():
         else:
             df_resultado["Total_Entradas"] = 0.0
             df_resultado["Total_Saidas"] = 0.0
-            st.info("Nenhuma movimentação encontrada nos XMLs enviados para os SKUs da lista.")
+            st.warning(
+                "Nenhuma movimentação encontrada nos XMLs enviados para os SKUs cadastrados. "
+                "Verifique se o código bipado na coleta corresponde ao <cProd> ou <cEAN> da nota."
+            )
 
         df_resultado["Total_Entradas"] = df_resultado["Total_Entradas"].fillna(0.0)
         df_resultado["Total_Saidas"] = df_resultado["Total_Saidas"].fillna(0.0)
@@ -263,7 +291,7 @@ def renderizar_aba_xml():
         df_res = st.session_state["df_xml_consolidado"]
 
         st.subheader("3. Consolidado de Entradas e Saídas por SKU")
-        st.dataframe(df_res, use_container_width=True)
+        st.table(df_res)
 
         data_hoje = datetime.now().strftime("%Y-%m-%d_%H-%M")
         csv_consolidado = df_res.to_csv(index=False, sep=";").encode("utf-8-sig")
