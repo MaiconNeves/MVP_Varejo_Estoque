@@ -67,14 +67,16 @@ def _converter_numero(serie: pd.Series) -> pd.Series:
     return serie.apply(_parse)
 
 
-def _padronizar_colunas_base(df: pd.DataFrame) -> pd.DataFrame:
+def _padronizar_colunas_base(df: pd.DataFrame, origem: str) -> tuple[pd.DataFrame, str]:
     """
-    Garante que o DataFrame da coleta tenha sempre as colunas 'SKU' e 'Qtd Física'
-    independentemente de acentuação, maiúsculas/minúsculas ou nome no CSV.
+    Padroniza a coluna de identificação como 'SKU' e preserva/define a coluna
+    de quantidade inicial conforme a origem escolhida:
+      - 'csv'    -> coluna 'Qtd Física'
+      - 'sessao' -> coluna 'Qtd Inicial'
+    Retorna (DataFrame padronizado, nome_coluna_qtd_inicial).
     """
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
-
     mapa_norm = {_normalizar_texto_coluna(c): c for c in df.columns}
 
     # 1. Localiza a coluna de identificação (SKU / EAN)
@@ -86,8 +88,12 @@ def _padronizar_colunas_base(df: pd.DataFrame) -> pd.DataFrame:
         if col_sku:
             df = df.rename(columns={col_sku: "SKU"})
 
-    # 2. Localiza a coluna de quantidade inicial (Qtd Física / Qtd Inicial / etc.)
-    if "Qtd Física" not in df.columns:
+    df["SKU"] = df["SKU"].astype(str).str.strip()
+
+    # 2. Define o nome alvo da quantidade inicial conforme a origem
+    nome_alvo_qtd = "Qtd Física" if origem == "csv" else "Qtd Inicial"
+
+    if nome_alvo_qtd not in df.columns:
         candidatos_qtd = [
             "qtd fisica",
             "qtd inicial",
@@ -102,14 +108,13 @@ def _padronizar_colunas_base(df: pd.DataFrame) -> pd.DataFrame:
         ]
         col_qtd = next((mapa_norm[k] for k in candidatos_qtd if k in mapa_norm), None)
         if col_qtd:
-            df = df.rename(columns={col_qtd: "Qtd Física"})
+            df = df.rename(columns={col_qtd: nome_alvo_qtd})
         else:
-            df["Qtd Física"] = 0.0
+            df[nome_alvo_qtd] = 0.0
 
-    df["SKU"] = df["SKU"].astype(str).str.strip()
-    df["Qtd Física"] = _converter_numero(df["Qtd Física"])
+    df[nome_alvo_qtd] = _converter_numero(df[nome_alvo_qtd])
 
-    return df
+    return df, nome_alvo_qtd
 
 
 def _extrair_chaves_item(prod_elem) -> list[str]:
@@ -225,11 +230,15 @@ def renderizar_aba_xml():
     )
 
     df_base = None
+    origem_tipo = "sessao" if fonte_base == "Usar itens coletados na sessão atual" else "csv"
+    col_qtd_inicial = "Qtd Inicial" if origem_tipo == "sessao" else "Qtd Física"
 
-    if fonte_base == "Usar itens coletados na sessão atual":
+    if origem_tipo == "sessao":
         itens_sessao = st.session_state.get("itens_coletados", {})
         if itens_sessao:
-            df_base = _padronizar_colunas_base(pd.DataFrame(list(itens_sessao.values())))
+            df_base, col_qtd_inicial = _padronizar_colunas_base(
+                pd.DataFrame(list(itens_sessao.values())), origem="sessao"
+            )
             st.success(f"Base ativa carregada com **{len(df_base)}** SKU(s) da sessão.")
         else:
             st.warning(
@@ -248,7 +257,7 @@ def renderizar_aba_xml():
                 texto_csv = conteudo_bytes.decode("utf-8-sig")
                 separador = ";" if ";" in texto_csv.splitlines()[0] else ","
                 df_lido = pd.read_csv(io.StringIO(texto_csv), sep=separador, dtype=str)
-                df_base = _padronizar_colunas_base(df_lido)
+                df_base, col_qtd_inicial = _padronizar_colunas_base(df_lido, origem="csv")
                 st.success(f"CSV carregado com **{len(df_base)}** SKU(s).")
             except Exception as e:
                 st.error(f"Erro ao ler o arquivo CSV: {e}")
@@ -276,7 +285,7 @@ def renderizar_aba_xml():
         return
 
     if st.button("⚙️ Processar XMLs e Gerar Consolidado", type="primary", use_container_width=True):
-        df_base = _padronizar_colunas_base(df_base)
+        df_base, col_qtd_inicial = _padronizar_colunas_base(df_base, origem=origem_tipo)
 
         codigos_map = {}
         for sku_val in df_base["SKU"].astype(str):
@@ -302,7 +311,6 @@ def renderizar_aba_xml():
         df_movs = pd.DataFrame(todas_movs)
         df_resultado = df_base.copy()
 
-        # Remove colunas antigas caso existam para evitar conflito no merge
         for col_antiga in ("Total_Entradas", "Total_Saidas", "Saldo_Calculado"):
             if col_antiga in df_resultado.columns:
                 df_resultado = df_resultado.drop(columns=[col_antiga])
@@ -331,13 +339,14 @@ def renderizar_aba_xml():
                 "Verifique se o código bipado na coleta corresponde ao <cProd> ou <cEAN> da nota."
             )
 
-        df_resultado["Qtd Física"] = _converter_numero(df_resultado["Qtd Física"])
+        df_resultado[col_qtd_inicial] = _converter_numero(df_resultado[col_qtd_inicial])
         df_resultado["Total_Entradas"] = _converter_numero(df_resultado["Total_Entradas"].fillna(0.0))
         df_resultado["Total_Saidas"] = _converter_numero(df_resultado["Total_Saidas"].fillna(0.0))
 
-        # Fórmula explícita: Quantidade Inicial (Qtd Física) + Entradas - Saídas
+        # 1. Quando carregado por CSV: Qtd Física + Total_Entradas - Total_Saidas
+        # 2. Quando carregado pela sessão atual: Qtd Inicial + Total_Entradas - Total_Saidas
         df_resultado["Saldo_Calculado"] = (
-            df_resultado["Qtd Física"]
+            df_resultado[col_qtd_inicial]
             + df_resultado["Total_Entradas"]
             - df_resultado["Total_Saidas"]
         )
