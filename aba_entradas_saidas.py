@@ -1,5 +1,6 @@
 from datetime import datetime
 import io
+import unicodedata
 import xml.etree.ElementTree as ET
 import pandas as pd
 import streamlit as st
@@ -28,6 +29,12 @@ def _get_text(elem, tag_name: str, default: str = "") -> str:
     return default
 
 
+def _normalizar_texto_coluna(nome: str) -> str:
+    """Remove acentos, espaços extras e converte para minúsculas para localizar colunas com segurança."""
+    texto = unicodedata.normalize("NFKD", str(nome)).encode("ASCII", "ignore").decode("ASCII")
+    return texto.strip().lower()
+
+
 def _normalizar_codigo(valor: str) -> str:
     """Normaliza código SKU/EAN (remove espaços e zeros à esquerda opcionais)."""
     if valor is None:
@@ -38,34 +45,69 @@ def _normalizar_codigo(valor: str) -> str:
     return texto.lstrip("0") or texto
 
 
+def _converter_numero(serie: pd.Series) -> pd.Series:
+    """Converte strings numéricas em formato brasileiro (1.250,50) ou americano (1250.50) para float."""
+    def _parse(val):
+        if pd.isna(val):
+            return 0.0
+        if isinstance(val, (int, float)):
+            return float(val)
+        s = str(val).strip()
+        if not s:
+            return 0.0
+        if "," in s and "." in s:
+            s = s.replace(".", "").replace(",", ".")
+        elif "," in s:
+            s = s.replace(",", ".")
+        try:
+            return float(s)
+        except ValueError:
+            return 0.0
+
+    return serie.apply(_parse)
+
+
 def _padronizar_colunas_base(df: pd.DataFrame) -> pd.DataFrame:
     """
     Garante que o DataFrame da coleta tenha sempre as colunas 'SKU' e 'Qtd Física'
-    independentemente do nome original no CSV ou na sessão.
+    independentemente de acentuação, maiúsculas/minúsculas ou nome no CSV.
     """
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
 
-    if "SKU" not in df.columns:
-        possiveis_codigos = ["EAN", "Código", "Codigo", "SKU / EAN", "COD", "cProd", "cEAN"]
-        col_encontrada = next((c for c in possiveis_codigos if c in df.columns), None)
-        if col_encontrada is None and len(df.columns) > 0:
-            col_encontrada = df.columns[0]
-        if col_encontrada:
-            df = df.rename(columns={col_encontrada: "SKU"})
+    mapa_norm = {_normalizar_texto_coluna(c): c for c in df.columns}
 
+    # 1. Localiza a coluna de identificação (SKU / EAN)
+    if "SKU" not in df.columns:
+        candidatos_sku = ["sku", "ean", "codigo", "sku / ean", "cod", "cprod", "cean"]
+        col_sku = next((mapa_norm[k] for k in candidatos_sku if k in mapa_norm), None)
+        if col_sku is None and len(df.columns) > 0:
+            col_sku = df.columns[0]
+        if col_sku:
+            df = df.rename(columns={col_sku: "SKU"})
+
+    # 2. Localiza a coluna de quantidade inicial (Qtd Física / Qtd Inicial / etc.)
     if "Qtd Física" not in df.columns:
-        possiveis_qtds = ["Qtd", "Quantidade", "Qtd Inicial", "Qtd_Inicial", "Saldo", "Estoque"]
-        col_qtd = next((c for c in possiveis_qtds if c in df.columns), None)
+        candidatos_qtd = [
+            "qtd fisica",
+            "qtd inicial",
+            "qtd_inicial",
+            "quantidade inicial",
+            "quantidade",
+            "qtd",
+            "saldo",
+            "saldo inicial",
+            "estoque",
+            "estoque inicial",
+        ]
+        col_qtd = next((mapa_norm[k] for k in candidatos_qtd if k in mapa_norm), None)
         if col_qtd:
             df = df.rename(columns={col_qtd: "Qtd Física"})
         else:
             df["Qtd Física"] = 0.0
 
     df["SKU"] = df["SKU"].astype(str).str.strip()
-    df["Qtd Física"] = pd.to_numeric(
-        df["Qtd Física"].astype(str).str.replace(",", "."), errors="coerce"
-    ).fillna(0.0)
+    df["Qtd Física"] = _converter_numero(df["Qtd Física"])
 
     return df
 
@@ -260,6 +302,11 @@ def renderizar_aba_xml():
         df_movs = pd.DataFrame(todas_movs)
         df_resultado = df_base.copy()
 
+        # Remove colunas antigas caso existam para evitar conflito no merge
+        for col_antiga in ("Total_Entradas", "Total_Saidas", "Saldo_Calculado"):
+            if col_antiga in df_resultado.columns:
+                df_resultado = df_resultado.drop(columns=[col_antiga])
+
         if not df_movs.empty:
             entradas = (
                 df_movs[df_movs["Tipo"] == "Entrada"]
@@ -284,8 +331,11 @@ def renderizar_aba_xml():
                 "Verifique se o código bipado na coleta corresponde ao <cProd> ou <cEAN> da nota."
             )
 
-        df_resultado["Total_Entradas"] = df_resultado["Total_Entradas"].fillna(0.0)
-        df_resultado["Total_Saidas"] = df_resultado["Total_Saidas"].fillna(0.0)
+        df_resultado["Qtd Física"] = _converter_numero(df_resultado["Qtd Física"])
+        df_resultado["Total_Entradas"] = _converter_numero(df_resultado["Total_Entradas"].fillna(0.0))
+        df_resultado["Total_Saidas"] = _converter_numero(df_resultado["Total_Saidas"].fillna(0.0))
+
+        # Fórmula explícita: Quantidade Inicial (Qtd Física) + Entradas - Saídas
         df_resultado["Saldo_Calculado"] = (
             df_resultado["Qtd Física"]
             + df_resultado["Total_Entradas"]
