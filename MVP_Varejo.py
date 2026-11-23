@@ -1,8 +1,9 @@
 import streamlit as st
 from aba_coleta import renderizar_aba_coleta
+from aba_entradas_saidas import renderizar_aba_xml
 
 st.set_page_config(page_title="MVP Coleta de Estoque", layout="wide")
-st.title("Etapa 1: Coleta Física de Estoque")
+st.title("MVP Varejo - Controle de Estoque")
 
 # Inicializa o estado da sessão
 if "itens_coletados" not in st.session_state:
@@ -14,6 +15,16 @@ if "dados_api" not in st.session_state:
 if "aviso_duplicado" not in st.session_state:
     st.session_state.aviso_duplicado = None
 
-# Renderiza a tela de coleta
-renderizar_aba_coleta()
+# Divide as etapas em abas
+aba1, aba2 = st.tabs([
+    "Etapa 1: Coleta Física de Estoque",
+    "Etapa 2: Entradas e Saídas (XML)",
+])
+
+with aba1:
+    renderizar_aba_coleta()
+
+with aba2:
+    renderizar_aba_xml()
+
 
