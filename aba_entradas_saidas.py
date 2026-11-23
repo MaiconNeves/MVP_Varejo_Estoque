@@ -38,6 +38,38 @@ def _normalizar_codigo(valor: str) -> str:
     return texto.lstrip("0") or texto
 
 
+def _padronizar_colunas_base(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Garante que o DataFrame da coleta tenha sempre as colunas 'SKU' e 'Qtd Física'
+    independentemente do nome original no CSV ou na sessão.
+    """
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    if "SKU" not in df.columns:
+        possiveis_codigos = ["EAN", "Código", "Codigo", "SKU / EAN", "COD", "cProd", "cEAN"]
+        col_encontrada = next((c for c in possiveis_codigos if c in df.columns), None)
+        if col_encontrada is None and len(df.columns) > 0:
+            col_encontrada = df.columns[0]
+        if col_encontrada:
+            df = df.rename(columns={col_encontrada: "SKU"})
+
+    if "Qtd Física" not in df.columns:
+        possiveis_qtds = ["Qtd", "Quantidade", "Qtd Inicial", "Qtd_Inicial", "Saldo", "Estoque"]
+        col_qtd = next((c for c in possiveis_qtds if c in df.columns), None)
+        if col_qtd:
+            df = df.rename(columns={col_qtd: "Qtd Física"})
+        else:
+            df["Qtd Física"] = 0.0
+
+    df["SKU"] = df["SKU"].astype(str).str.strip()
+    df["Qtd Física"] = pd.to_numeric(
+        df["Qtd Física"].astype(str).str.replace(",", "."), errors="coerce"
+    ).fillna(0.0)
+
+    return df
+
+
 def _extrair_chaves_item(prod_elem) -> list[str]:
     """
     Coleta todos os códigos possíveis do item no XML (<cProd>, <cEAN>, <cEANTrib>)
@@ -96,9 +128,6 @@ def processar_arquivo_xml(arquivo_xml, codigos_monitorados_map: dict, cnpj_loja:
         else:
             tipo_mov = "Entrada" if (modelo == "55" and tp_nf == "1") else "Saída"
     else:
-        # Regra padrão para simulação sem CNPJ informado:
-        # NFC-e (65) -> Saída (venda no PDV)
-        # NF-e (55) -> Entrada (compra recebida de fornecedor)
         if modelo == "65":
             tipo_mov = "Entrada" if fin_nfe == "4" else "Saída"
         else:
@@ -112,7 +141,6 @@ def processar_arquivo_xml(arquivo_xml, codigos_monitorados_map: dict, cnpj_loja:
         if prod is None:
             continue
 
-        # Tenta cruzar por <cProd>, <cEAN> ou <cEANTrib>
         chave_original_encontrada = None
         for candidato in _extrair_chaves_item(prod):
             if candidato in codigos_monitorados_map:
@@ -144,7 +172,6 @@ def renderizar_aba_xml():
         "Cruza a base de itens coletados (por SKU ou EAN) com os XMLs de entrada e saída para consolidar o saldo."
     )
 
-    # 1. Carregamento da base inicial de itens coletados (sessão atual ou upload de CSV)
     st.subheader("1. Base de SKUs Monitorados")
     fonte_base = st.radio(
         "Origem da lista de produtos:",
@@ -160,9 +187,7 @@ def renderizar_aba_xml():
     if fonte_base == "Usar itens coletados na sessão atual":
         itens_sessao = st.session_state.get("itens_coletados", {})
         if itens_sessao:
-            df_base = pd.DataFrame(list(itens_sessao.values()))
-            if "EAN" in df_base.columns and "SKU" not in df_base.columns:
-                df_base = df_base.rename(columns={"EAN": "SKU"})
+            df_base = _padronizar_colunas_base(pd.DataFrame(list(itens_sessao.values())))
             st.success(f"Base ativa carregada com **{len(df_base)}** SKU(s) da sessão.")
         else:
             st.warning(
@@ -180,18 +205,8 @@ def renderizar_aba_xml():
                 conteudo_bytes = arquivo_csv.read()
                 texto_csv = conteudo_bytes.decode("utf-8-sig")
                 separador = ";" if ";" in texto_csv.splitlines()[0] else ","
-                df_base = pd.read_csv(io.StringIO(texto_csv), sep=separador, dtype=str)
-
-                if "EAN" in df_base.columns and "SKU" not in df_base.columns:
-                    df_base = df_base.rename(columns={"EAN": "SKU"})
-
-                if "Qtd Física" in df_base.columns:
-                    df_base["Qtd Física"] = (
-                        df_base["Qtd Física"].astype(str).str.replace(",", ".").astype(float)
-                    )
-                else:
-                    df_base["Qtd Física"] = 0.0
-
+                df_lido = pd.read_csv(io.StringIO(texto_csv), sep=separador, dtype=str)
+                df_base = _padronizar_colunas_base(df_lido)
                 st.success(f"CSV carregado com **{len(df_base)}** SKU(s).")
             except Exception as e:
                 st.error(f"Erro ao ler o arquivo CSV: {e}")
@@ -202,7 +217,6 @@ def renderizar_aba_xml():
     with st.expander("Visualizar SKUs monitorados", expanded=False):
         st.table(df_base)
 
-    # 2. Upload múltiplo dos arquivos XML
     st.subheader("2. Upload dos Arquivos XML (NF-e e NFC-e)")
     cnpj_loja = st.text_input(
         "CNPJ da Loja (opcional — ajuda a distinguir compras de vendas em NF-e modelo 55)",
@@ -219,8 +233,9 @@ def renderizar_aba_xml():
     if not arquivos_xml:
         return
 
-    # 3. Processamento e consolidação
     if st.button("⚙️ Processar XMLs e Gerar Consolidado", type="primary", use_container_width=True):
+        df_base = _padronizar_colunas_base(df_base)
+
         codigos_map = {}
         for sku_val in df_base["SKU"].astype(str):
             sku_limpo = sku_val.strip()
@@ -243,9 +258,7 @@ def renderizar_aba_xml():
             st.warning(aviso)
 
         df_movs = pd.DataFrame(todas_movs)
-
         df_resultado = df_base.copy()
-        df_resultado["SKU"] = df_resultado["SKU"].astype(str).str.strip()
 
         if not df_movs.empty:
             entradas = (
@@ -273,20 +286,14 @@ def renderizar_aba_xml():
 
         df_resultado["Total_Entradas"] = df_resultado["Total_Entradas"].fillna(0.0)
         df_resultado["Total_Saidas"] = df_resultado["Total_Saidas"].fillna(0.0)
-
-        col_qtd_inicial = "Qtd Física" if "Qtd Física" in df_resultado.columns else "Qtd_Inicial"
-        if col_qtd_inicial not in df_resultado.columns:
-            df_resultado[col_qtd_inicial] = 0.0
-
         df_resultado["Saldo_Calculado"] = (
-            df_resultado[col_qtd_inicial]
+            df_resultado["Qtd Física"]
             + df_resultado["Total_Entradas"]
             - df_resultado["Total_Saidas"]
         )
 
         st.session_state["df_xml_consolidado"] = df_resultado
 
-    # 4. Exibição do consolidado e exportação CSV
     if "df_xml_consolidado" in st.session_state:
         df_res = st.session_state["df_xml_consolidado"]
 
