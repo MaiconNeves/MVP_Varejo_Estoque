@@ -69,11 +69,10 @@ def _converter_numero(serie: pd.Series) -> pd.Series:
 
 def _padronizar_colunas_base(df: pd.DataFrame, origem: str) -> tuple[pd.DataFrame, str]:
     """
-    Padroniza a coluna de identificação como 'SKU' e preserva/define a coluna
-    de quantidade inicial conforme a origem escolhida:
-      - 'csv'    -> coluna 'Qtd Física'
-      - 'sessao' -> coluna 'Qtd Inicial'
-    Retorna (DataFrame padronizado, nome_coluna_qtd_inicial).
+    Padroniza a coluna de identificação como 'SKU' e define a coluna de quantidade:
+      - 'csv'    -> lê 'Qtd Inicial' (ou variações) do CSV e preenche/iguala 'Qtd Física' = 'Qtd Inicial'
+      - 'sessao' -> lê a quantidade da sessão e define 'Qtd Inicial'
+    Retorna (DataFrame padronizado, nome_coluna_qtd_calculo).
     """
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
@@ -90,9 +89,36 @@ def _padronizar_colunas_base(df: pd.DataFrame, origem: str) -> tuple[pd.DataFram
 
     df["SKU"] = df["SKU"].astype(str).str.strip()
 
-    # 2. Define o nome alvo da quantidade inicial conforme a origem
-    nome_alvo_qtd = "Qtd Física" if origem == "csv" else "Qtd Inicial"
+    # 2. Tratamento específico por origem
+    if origem == "csv":
+        # Prioriza explicitamente 'Qtd Inicial' do CSV enviado
+        candidatos_inicial = [
+            "qtd inicial",
+            "qtd_inicial",
+            "quantidade inicial",
+            "qtd fisica",
+            "quantidade",
+            "qtd",
+            "saldo",
+            "saldo inicial",
+            "estoque",
+            "estoque inicial",
+        ]
+        col_origem_qtd = next((mapa_norm[k] for k in candidatos_inicial if k in mapa_norm), None)
 
+        if col_origem_qtd:
+            valores_qtd = _converter_numero(df[col_origem_qtd])
+        else:
+            valores_qtd = pd.Series([0.0] * len(df), index=df.index)
+
+        # Garante que 'Qtd Inicial' exista (se estava no CSV) e que 'Qtd Física' seja igual a 'Qtd Inicial'
+        if "Qtd Inicial" in df.columns:
+            df["Qtd Inicial"] = valores_qtd
+        df["Qtd Física"] = valores_qtd
+        return df, "Qtd Física"
+
+    # Origem pela sessão atual ('sessao')
+    nome_alvo_qtd = "Qtd Inicial"
     if nome_alvo_qtd not in df.columns:
         candidatos_qtd = [
             "qtd fisica",
@@ -102,9 +128,7 @@ def _padronizar_colunas_base(df: pd.DataFrame, origem: str) -> tuple[pd.DataFram
             "quantidade",
             "qtd",
             "saldo",
-            "saldo inicial",
             "estoque",
-            "estoque inicial",
         ]
         col_qtd = next((mapa_norm[k] for k in candidatos_qtd if k in mapa_norm), None)
         if col_qtd:
@@ -113,7 +137,6 @@ def _padronizar_colunas_base(df: pd.DataFrame, origem: str) -> tuple[pd.DataFram
             df[nome_alvo_qtd] = 0.0
 
     df[nome_alvo_qtd] = _converter_numero(df[nome_alvo_qtd])
-
     return df, nome_alvo_qtd
 
 
@@ -343,8 +366,8 @@ def renderizar_aba_xml():
         df_resultado["Total_Entradas"] = _converter_numero(df_resultado["Total_Entradas"].fillna(0.0))
         df_resultado["Total_Saidas"] = _converter_numero(df_resultado["Total_Saidas"].fillna(0.0))
 
-        # 1. Quando carregado por CSV: Qtd Física + Total_Entradas - Total_Saidas
-        # 2. Quando carregado pela sessão atual: Qtd Inicial + Total_Entradas - Total_Saidas
+        # 1. Origem CSV: Qtd Física (= Qtd Inicial) + Total_Entradas - Total_Saidas
+        # 2. Origem Sessão: Qtd Inicial + Total_Entradas - Total_Saidas
         df_resultado["Saldo_Calculado"] = (
             df_resultado[col_qtd_inicial]
             + df_resultado["Total_Entradas"]
