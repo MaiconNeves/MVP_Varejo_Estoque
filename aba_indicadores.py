@@ -271,21 +271,22 @@ def renderizar_aba_indicadores():
             (df_movs["Tipo"] == "Saída") & (df_movs["Data_Emissao"] != "")
         ].copy()
         if not df_saidas_dia.empty:
-        st.subheader("Evolução Diária de Vendas (Saídas)")
-        resumo_diario = (
-        df_saidas_dia.groupby("Data_Emissao", as_index=False)["Quantidade"]
-        .sum()
-        .sort_values("Data_Emissao")
-        )
-        st.bar_chart(resumo_diario.set_index("Data_Emissao")["Quantidade"])
-        # 5. Exportação do Relatório Completo de Indicadores
-        data_hoje = datetime.now().strftime("%Y-%m-%d_%H-%M")
-        csv_indicadores = df_filtrado.to_csv(index=False, sep=";").encode("utf-8-sig")
-        st.download_button(
+            st.subheader("Evolução Diária de Vendas (Saídas)")
+            resumo_diario = (
+                df_saidas_dia.groupby("Data_Emissao", as_index=False)["Quantidade"]
+                .sum()
+                .sort_values("Data_Emissao")
+            )
+            st.bar_chart(resumo_diario.set_index("Data_Emissao")["Quantidade"])
+
+    # 5. Exportação do Relatório Completo de Indicadores
+    data_hoje = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    csv_indicadores = df_filtrado.to_csv(index=False, sep=";").encode("utf-8-sig")
+    st.download_button(
         label="📥 Baixar Relatório Completo de Indicadores (.CSV)",
         data=csv_indicadores,
         file_name=f"indicadores_estoque_{data_hoje}.csv",
         mime="text/csv",
         type="primary",
         use_container_width=True,
-        )
+    )
