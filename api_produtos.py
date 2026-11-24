@@ -1,6 +1,7 @@
 import requests
 import streamlit as st
 
+
 @st.cache_data(ttl=3600)
 def buscar_dados_mestres(ean: str) -> dict:
     ean_limpo = "".join(filter(str.isdigit, str(ean)))
@@ -34,7 +35,7 @@ def buscar_dados_mestres(ean: str) -> dict:
     # 2. Fallback gratuito: UPCitemdb
     try:
         r = requests.get(
-            f"https://upcitemdb.com{ean_limpo}",
+            f"https://api.upcitemdb.com/prod/trial/lookup?upc={ean_limpo}",
             headers=headers,
             timeout=5,
         )
