@@ -69,9 +69,8 @@ def _converter_numero(serie: pd.Series) -> pd.Series:
 
 def _padronizar_colunas_base(df: pd.DataFrame, origem: str) -> tuple[pd.DataFrame, str]:
     """
-    Padroniza a coluna de identificação como 'SKU' e define a coluna de quantidade:
-      - 'csv'    -> lê 'Qtd Inicial' (ou variações) do CSV e preenche/iguala 'Qtd Física' = 'Qtd Inicial'
-      - 'sessao' -> lê a quantidade da sessão e define 'Qtd Inicial'
+    Padroniza a coluna de identificação como 'SKU', garante 'Fator_Conversao'
+    (padrão 1.0) e define a coluna de quantidade inicial conforme a origem.
     Retorna (DataFrame padronizado, nome_coluna_qtd_calculo).
     """
     df = df.copy()
@@ -89,9 +88,29 @@ def _padronizar_colunas_base(df: pd.DataFrame, origem: str) -> tuple[pd.DataFram
 
     df["SKU"] = df["SKU"].astype(str).str.strip()
 
-    # 2. Tratamento específico por origem
+    # 2. Garante a coluna Fator_Conversao (Caixa -> Unidade)
+    candidatos_fator = [
+        "fator_conversao",
+        "fator conversao",
+        "fator",
+        "embalagem",
+        "qtd_emb",
+        "qtd emb",
+        "multiplicador",
+        "mult",
+    ]
+    col_fator = next((mapa_norm[k] for k in candidatos_fator if k in mapa_norm), None)
+    if col_fator and col_fator != "Fator_Conversao":
+        df = df.rename(columns={col_fator: "Fator_Conversao"})
+
+    if "Fator_Conversao" in df.columns:
+        fatores = _converter_numero(df["Fator_Conversao"])
+        df["Fator_Conversao"] = fatores.where(fatores > 0, 1.0)
+    else:
+        df["Fator_Conversao"] = 1.0
+
+    # 3. Tratamento específico por origem
     if origem == "csv":
-        # Prioriza explicitamente 'Qtd Inicial' do CSV enviado
         candidatos_inicial = [
             "qtd inicial",
             "qtd_inicial",
@@ -111,13 +130,12 @@ def _padronizar_colunas_base(df: pd.DataFrame, origem: str) -> tuple[pd.DataFram
         else:
             valores_qtd = pd.Series([0.0] * len(df), index=df.index)
 
-        # Garante que 'Qtd Inicial' exista (se estava no CSV) e que 'Qtd Física' seja igual a 'Qtd Inicial'
         if "Qtd Inicial" in df.columns:
             df["Qtd Inicial"] = valores_qtd
         df["Qtd Física"] = valores_qtd
         return df, "Qtd Física"
 
-    # Origem pela sessão atual ('sessao')
+    # Origem pela sessão atual ('sessao') ou Ponto de Partida ('ponto_partida')
     nome_alvo_qtd = "Qtd Inicial"
     if nome_alvo_qtd not in df.columns:
         candidatos_qtd = [
@@ -186,7 +204,6 @@ def processar_arquivo_xml(arquivo_xml, codigos_monitorados_map: dict, cnpj_loja:
     tp_nf = _get_text(ide, "tpNF")  # '0' = Entrada, '1' = Saída (na visão do emitente)
     fin_nfe = _get_text(ide, "finNFe")  # '1' = Normal, '4' = Devolução
 
-    # Extração da data de emissão (formato AAAA-MM-DD)
     dh_emi_bruta = _get_text(ide, "dhEmi") or _get_text(ide, "dEmi")
     data_emissao = dh_emi_bruta[:10] if len(dh_emi_bruta) >= 10 else ""
 
@@ -254,20 +271,35 @@ def renderizar_aba_xml():
     )
 
     st.subheader("1. Base de SKUs Monitorados")
+    opcoes_fonte = [
+        "Usar itens coletados na sessão atual",
+        "Enviar planilha CSV (coleta ou ciclo anterior)",
+    ]
+    if "ponto_partida" in st.session_state and st.session_state["ponto_partida"] is not None:
+        opcoes_fonte.insert(0, "Continuar do Ponto de Partida salvo (Próximo Ciclo)")
+
     fonte_base = st.radio(
         "Origem da lista de produtos:",
-        options=[
-            "Usar itens coletados na sessão atual",
-            "Enviar planilha CSV exportada anteriormente",
-        ],
+        options=opcoes_fonte,
         horizontal=True,
     )
 
     df_base = None
-    origem_tipo = "sessao" if fonte_base == "Usar itens coletados na sessão atual" else "csv"
-    col_qtd_inicial = "Qtd Inicial" if origem_tipo == "sessao" else "Qtd Física"
+    origem_tipo = "sessao"
+    col_qtd_inicial = "Qtd Inicial"
 
-    if origem_tipo == "sessao":
+    if fonte_base == "Continuar do Ponto de Partida salvo (Próximo Ciclo)":
+        origem_tipo = "ponto_partida"
+        snap = st.session_state["ponto_partida"]
+        df_base, col_qtd_inicial = _padronizar_colunas_base(
+            snap["df_base_proximo_ciclo"], origem="ponto_partida"
+        )
+        st.success(
+            f"Ponto de Partida de **{snap['data_registro']}** carregado com **{len(df_base)}** SKU(s). "
+            "O saldo final anterior assumiu o lugar de **Qtd Inicial**."
+        )
+    elif fonte_base == "Usar itens coletados na sessão atual":
+        origem_tipo = "sessao"
         itens_sessao = st.session_state.get("itens_coletados", {})
         if itens_sessao:
             df_base, col_qtd_inicial = _padronizar_colunas_base(
@@ -279,8 +311,9 @@ def renderizar_aba_xml():
                 "Nenhum item coletado na sessão atual. Colete itens na primeira aba ou envie um arquivo CSV."
             )
     else:
+        origem_tipo = "csv"
         arquivo_csv = st.file_uploader(
-            "Selecione o arquivo .CSV da coleta",
+            "Selecione o arquivo .CSV (da coleta ou 'base_proximo_ciclo')",
             type=["csv"],
             key="upload_csv_base_xml",
         )
@@ -292,6 +325,21 @@ def renderizar_aba_xml():
                 separador = ";" if ";" in texto_csv.splitlines()[0] else ","
                 df_lido = pd.read_csv(io.StringIO(texto_csv), sep=separador, dtype=str)
                 df_base, col_qtd_inicial = _padronizar_colunas_base(df_lido, origem="csv")
+
+                # Se for um arquivo exportado como Ponto de Partida, restaura a referência de comparação
+                if "Ref_Faturamento" in df_lido.columns and len(df_lido) > 0:
+                    primeira = df_lido.iloc[0]
+                    st.session_state["ponto_partida"] = {
+                        "data_registro": str(primeira.get("Ref_Data", "Ciclo Anterior")),
+                        "faturamento_total": float(str(primeira.get("Ref_Faturamento", 0)).replace(",", ".") or 0),
+                        "valor_estoque_total": float(str(primeira.get("Ref_Capital", 0)).replace(",", ".") or 0),
+                        "qtd_ruptura": int(float(str(primeira.get("Ref_Ruptura_Qtd", 0)).replace(",", ".") or 0)),
+                        "perda_ruptura_total": float(str(primeira.get("Ref_Perda_Ruptura", 0)).replace(",", ".") or 0),
+                        "df_base_proximo_ciclo": df_base.copy(),
+                        "df_indicadores_ref": df_lido.copy(),
+                    }
+                    st.info("📌 Arquivo de **Ponto de Partida** detectado! Os indicadores anteriores serão usados para comparação.")
+
                 st.success(f"CSV carregado com {len(df_base)} SKU(s).")
             except Exception as e:
                 st.error(f"Erro ao ler o arquivo CSV: {e}")
@@ -299,8 +347,33 @@ def renderizar_aba_xml():
     if df_base is None or df_base.empty:
         return
 
-    with st.expander("Visualizar SKUs monitorados", expanded=False):
-        st.table(df_base)
+    with st.expander("Visualizar / Editar SKUs, Saldo Inicial e Fator de Conversão (Caixa -> Unidade)", expanded=False):
+        st.caption(
+            "Ajuste o **Fator_Conversao** se a nota de entrada vier em caixas/fardos (ex: `12` para caixa com 12 unidades) "
+            "ou corrija pontualmente o saldo inicial se houve contagem física."
+        )
+        colunas_bloqueadas = [c for c in df_base.columns if c not in (col_qtd_inicial, "Fator_Conversao")]
+        df_base = st.data_editor(
+            df_base,
+            disabled=colunas_bloqueadas,
+            column_config={
+                "Fator_Conversao": st.column_config.NumberColumn(
+                    "Fator Conv. (Cx -> Un)",
+                    min_value=0.01,
+                    step=1.0,
+                    format="%.2f",
+                ),
+                col_qtd_inicial: st.column_config.NumberColumn(
+                    col_qtd_inicial,
+                    min_value=0.0,
+                    step=1.0,
+                    format="%.2f",
+                ),
+            },
+            use_container_width=True,
+            hide_index=True,
+            key=f"editor_base_xml_{origem_tipo}",
+        )
 
     st.subheader("2. Upload dos Arquivos XML (NF-e e NFC-e)")
     cnpj_loja = st.text_input(
@@ -340,8 +413,19 @@ def renderizar_aba_xml():
             st.warning(aviso)
 
         df_movs = pd.DataFrame(todas_movs)
-        st.session_state["df_movs_detalhadas"] = df_movs
         df_resultado = df_base.copy()
+
+        # Aplica o Fator de Conversão (Caixa -> Unidade) nas movimentações de Entrada
+        if not df_movs.empty:
+            mapa_fator = dict(zip(df_resultado["SKU"], df_resultado["Fator_Conversao"]))
+            df_movs["Fator_Aplicado"] = df_movs.apply(
+                lambda r: mapa_fator.get(r["SKU"], 1.0) if r["Tipo"] == "Entrada" else 1.0,
+                axis=1,
+            )
+            df_movs["Quantidade_Original_XML"] = df_movs["Quantidade"]
+            df_movs["Quantidade"] = df_movs["Quantidade"] * df_movs["Fator_Aplicado"]
+
+        st.session_state["df_movs_detalhadas"] = df_movs
 
         # Remove colunas calculadas anteriormente para evitar duplicidade ao reprocessar
         colunas_antigas = (
@@ -387,6 +471,7 @@ def renderizar_aba_xml():
         # Garante tipagem numérica e preenche valores nulos
         colunas_numericas = [
             col_qtd_inicial,
+            "Fator_Conversao",
             "Total_Entradas",
             "Total_Saidas",
             "Valor_Entradas",
@@ -398,14 +483,13 @@ def renderizar_aba_xml():
         df_resultado["Ultima_Entrada"] = df_resultado["Ultima_Entrada"].fillna("")
         df_resultado["Ultima_Saida"] = df_resultado["Ultima_Saida"].fillna("")
 
-        # 1. Origem CSV: Qtd Física (= Qtd Inicial) + Total_Entradas - Total_Saidas
-        # 2. Origem Sessão: Qtd Inicial + Total_Entradas - Total_Saidas
+        # Saldo_Calculado já considera Total_Entradas multiplicado pelo Fator_Conversao
         df_resultado["Saldo_Calculado"] = (
             df_resultado[col_qtd_inicial] + df_resultado["Total_Entradas"] - df_resultado["Total_Saidas"]
         )
         st.session_state["df_xml_consolidado"] = df_resultado
 
-    if "df_xml_consolidado" in st.session_state:
+    if "df_xml_consolidado" in st.session_state and st.session_state["df_xml_consolidado"] is not None:
         df_res = st.session_state["df_xml_consolidado"]
         st.subheader("3. Consolidado de Entradas e Saídas por SKU")
         st.table(df_res)
