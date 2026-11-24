@@ -53,7 +53,6 @@ def contar_itens_nas_fotos(lista_fotos, nome_produto):
     client = genai.Client(api_key=api_key)
     total_contado = 0
 
-    # Modelos vigentes no Google AI Studio (com fallback automático)
     modelos_disponiveis = [
         "gemini-3.8-flash",
         "gemini-3.5-flash-lite",
@@ -89,7 +88,6 @@ def contar_itens_nas_fotos(lista_fotos, nome_produto):
                 break
             except errors.ClientError as e:
                 ultimo_erro_api = e
-                # Se for erro de chave inválida (400/403), interrompe imediatamente
                 if getattr(e, "code", None) in (400, 403):
                     break
                 continue
@@ -227,7 +225,6 @@ def renderizar_aba_coleta():
             if st.session_state.modo_foto_inventario:
                 desligar_cameras_android()
 
-        # Painel de captura via câmera nativa do Android (Resistente a reload)
         if st.session_state.modo_foto_inventario:
             desligar_cameras_android()
             with st.container(border=True):
@@ -274,7 +271,7 @@ def renderizar_aba_coleta():
         # Formulário principal (editável antes de salvar)
         with st.form("form_estoque", clear_on_submit=True):
             descricao = st.text_input("Descrição", value=desc_padrao)
-            c1, c2, c3 = st.columns(3)
+            c1, c2, c3, c4 = st.columns(4)
             categoria = c1.text_input("Categoria / Setor", value="Geral")
             marca = c2.text_input("Marca", value=info.get("marca", ""))
             quantidade = c3.number_input(
@@ -282,6 +279,13 @@ def renderizar_aba_coleta():
                 min_value=0.0,
                 value=st.session_state.qtd_calculada_ia,
                 step=1.0,
+            )
+            fator_conv = c4.number_input(
+                "Fator Conv. (Cx -> Un)",
+                min_value=1.0,
+                value=1.0,
+                step=1.0,
+                help="Se a nota fiscal de compra vem em caixa com 12 unidades e você vende por unidade, informe 12.",
             )
 
             b1, b2 = st.columns(2)
@@ -292,6 +296,7 @@ def renderizar_aba_coleta():
                     "Categoria": categoria,
                     "Marca": marca,
                     "Qtd Física": quantidade,
+                    "Fator_Conversao": fator_conv,
                 }
                 st.session_state.ultimo_codigo_scanner = None
                 resetar_para_proximo_item()
@@ -306,7 +311,7 @@ def renderizar_aba_coleta():
     if st.session_state.itens_coletados:
         st.subheader(f"Itens Monitorados ({len(st.session_state.itens_coletados)})")
         df_coletados = pd.DataFrame(list(st.session_state.itens_coletados.values()))
-        st.dataframe(df_coletados, use_container_width=True)
+        st.dataframe(df_coletados, use_container_width=True, hide_index=True)
 
         csv_bytes = df_coletados.to_csv(index=False, sep=";").encode("utf-8-sig")
         data_hoje = datetime.now().strftime("%Y-%m-%d_%H-%M")
