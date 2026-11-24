@@ -7,7 +7,7 @@ import streamlit as st
 
 
 def _strip_ns(tag: str) -> str:
-    """Remove o namespace XML da tag (ex: {http://www.portalfiscal.inf.br/nfe}infNFe -> infNFe)."""
+    """Remove o namespace XML da tag (ex: {http://portalfiscal.inf.br}infNFe -> infNFe)."""
     return tag.split("}", 1)[-1] if "}" in tag else tag
 
 
@@ -159,7 +159,7 @@ def _extrair_chaves_item(prod_elem) -> list[str]:
 def processar_arquivo_xml(arquivo_xml, codigos_monitorados_map: dict, cnpj_loja: str = ""):
     """
     Lê um arquivo XML de NF-e (modelo 55) ou NFC-e (modelo 65) e extrai
-    as movimentações dos itens presentes na lista monitorada.
+    as movimentações, datas de emissão e valores totais dos itens presentes na lista monitorada.
     """
     movimentacoes = []
     try:
@@ -185,6 +185,10 @@ def processar_arquivo_xml(arquivo_xml, codigos_monitorados_map: dict, cnpj_loja:
     modelo = _get_text(ide, "mod")  # '55' = NF-e, '65' = NFC-e
     tp_nf = _get_text(ide, "tpNF")  # '0' = Entrada, '1' = Saída (na visão do emitente)
     fin_nfe = _get_text(ide, "finNFe")  # '1' = Normal, '4' = Devolução
+
+    # Extração da data de emissão (formato AAAA-MM-DD)
+    dh_emi_bruta = _get_text(ide, "dhEmi") or _get_text(ide, "dEmi")
+    data_emissao = dh_emi_bruta[:10] if len(dh_emi_bruta) >= 10 else ""
 
     cnpj_emit = "".join(filter(str.isdigit, _get_text(emit, "CNPJ")))
     cnpj_dest = "".join(filter(str.isdigit, _get_text(dest, "CNPJ")))
@@ -225,11 +229,18 @@ def processar_arquivo_xml(arquivo_xml, codigos_monitorados_map: dict, cnpj_loja:
         except ValueError:
             qtd = 0.0
 
+        try:
+            valor_total = float(_get_text(prod, "vProd", "0").replace(",", "."))
+        except ValueError:
+            valor_total = 0.0
+
         movimentacoes.append(
             {
                 "SKU": chave_original_encontrada,
                 "Tipo": tipo_mov,
+                "Data_Emissao": data_emissao,
                 "Quantidade": qtd,
+                "Valor_Total": valor_total,
             }
         )
 
@@ -268,128 +279,146 @@ def renderizar_aba_xml():
                 "Nenhum item coletado na sessão atual. Colete itens na primeira aba ou envie um arquivo CSV."
             )
     else:
-        arquivo_csv = st.file_uploader(
-            "Selecione o arquivo .CSV da coleta",
-            type=["csv"],
-            key="upload_csv_base_xml",
+    arquivo_csv = st.file_uploader(
+        "Selecione o arquivo .CSV da coleta",
+        type=["csv"],
+        key="upload_csv_base_xml",
+    )
+    if arquivo_csv is not None:
+        try:
+            arquivo_csv.seek(0)
+            conteudo_bytes = arquivo_csv.read()
+            texto_csv = conteudo_bytes.decode("utf-8-sig")
+            separador = ";" if ";" in texto_csv.splitlines()[0] else ","
+            df_lido = pd.read_csv(io.StringIO(texto_csv), sep=separador, dtype=str)
+            df_base, col_qtd_inicial = _padronizar_colunas_base(df_lido, origem="csv")
+            st.success(f"CSV carregado com {len(df_base)} SKU(s).")
+        except Exception as e:
+            st.error(f"Erro ao ler o arquivo CSV: {e}")
+
+if df_base is None or df_base.empty:
+    return
+
+with st.expander("Visualizar SKUs monitorados", expanded=False):
+    st.table(df_base)
+
+st.subheader("2. Upload dos Arquivos XML (NF-e e NFC-e)")
+cnpj_loja = st.text_input(
+    "CNPJ da Loja (opcional — ajuda a distinguir compras de vendas em NF-e modelo 55)",
+    placeholder="Ex: 11.111.111/0001-91 (deixe vazio para considerar NF-e 55 = Entrada e NFC-e 65 = Saída)",
+)
+arquivos_xml = st.file_uploader(
+    "Selecione um ou mais arquivos .XML",
+    type=["xml"],
+    accept_multiple_files=True,
+    key="upload_multiplos_xml",
+)
+
+if not arquivos_xml:
+    return
+
+if st.button("⚙️ Processar XMLs e Gerar Consolidado", type="primary", use_container_width=True):
+    df_base, col_qtd_inicial = _padronizar_colunas_base(df_base, origem=origem_tipo)
+    codigos_map = {}
+    for sku_val in df_base["SKU"].astype(str):
+        sku_limpo = sku_val.strip()
+        codigos_map[sku_limpo] = sku_limpo
+        norm = _normalizar_codigo(sku_limpo)
+        if norm:
+            codigos_map[norm] = sku_limpo
+
+    todas_movs = []
+    avisos = []
+    with st.spinner(f"Processando {len(arquivos_xml)} arquivo(s) XML..."):
+        for arq in arquivos_xml:
+            movs, erro = processar_arquivo_xml(arq, codigos_map, cnpj_loja)
+            if erro:
+                avisos.append(erro)
+            todas_movs.extend(movs)
+
+    for aviso in avisos:
+        st.warning(aviso)
+
+    df_movs = pd.DataFrame(todas_movs)
+    st.session_state["df_movs_detalhadas"] = df_movs
+    df_resultado = df_base.copy()
+
+    # Remove colunas calculadas anteriormente para evitar duplicidade ao reprocessar
+    colunas_antigas = (
+        "Total_Entradas",
+        "Total_Saidas",
+        "Valor_Entradas",
+        "Valor_Saidas",
+        "Ultima_Entrada",
+        "Ultima_Saida",
+        "Saldo_Calculado",
+    )
+    for col_antiga in colunas_antigas:
+        if col_antiga in df_resultado.columns:
+            df_resultado = df_resultado.drop(columns=[col_antiga])
+
+    if not df_movs.empty:
+        df_entradas = df_movs[df_movs["Tipo"] == "Entrada"]
+        df_saidas = df_movs[df_movs["Tipo"] == "Saída"]
+        entradas = df_entradas.groupby("SKU", as_index=False).agg(
+            Total_Entradas=("Quantidade", "sum"),
+            Valor_Entradas=("Valor_Total", "sum"),
+            Ultima_Entrada=("Data_Emissao", "max"),
         )
-        if arquivo_csv is not None:
-            try:
-                arquivo_csv.seek(0)
-                conteudo_bytes = arquivo_csv.read()
-                texto_csv = conteudo_bytes.decode("utf-8-sig")
-                separador = ";" if ";" in texto_csv.splitlines()[0] else ","
-                df_lido = pd.read_csv(io.StringIO(texto_csv), sep=separador, dtype=str)
-                df_base, col_qtd_inicial = _padronizar_colunas_base(df_lido, origem="csv")
-                st.success(f"CSV carregado com **{len(df_base)}** SKU(s).")
-            except Exception as e:
-                st.error(f"Erro ao ler o arquivo CSV: {e}")
+        saidas = df_saidas.groupby("SKU", as_index=False).agg(
+            Total_Saidas=("Quantidade", "sum"),
+            Valor_Saidas=("Valor_Total", "sum"),
+            Ultima_Saida=("Data_Emissao", "max"),
+        )
+        df_resultado = df_resultado.merge(entradas, on="SKU", how="left")
+        df_resultado = df_resultado.merge(saidas, on="SKU", how="left")
+    else:
+        df_resultado["Total_Entradas"] = 0.0
+        df_resultado["Total_Saidas"] = 0.0
+        df_resultado["Valor_Entradas"] = 0.0
+        df_resultado["Valor_Saidas"] = 0.0
+        df_resultado["Ultima_Entrada"] = ""
+        df_resultado["Ultima_Saida"] = ""
+        st.warning(
+            "Nenhuma movimentação encontrada nos XMLs enviados para os SKUs cadastrados. "
+            "Verifique se o código bipado na coleta corresponde ao <cProd> ou <cEAN> da nota."
+        )
 
-    if df_base is None or df_base.empty:
-        return
+    # Garante tipagem numérica e preenche valores nulos
+    colunas_numericas = [
+        col_qtd_inicial,
+        "Total_Entradas",
+        "Total_Saidas",
+        "Valor_Entradas",
+        "Valor_Saidas",
+    ]
+    for col_num in colunas_numericas:
+        df_resultado[col_num] = _converter_numero(df_resultado[col_num].fillna(0.0))
 
-    with st.expander("Visualizar SKUs monitorados", expanded=False):
-        st.table(df_base)
+    df_resultado["Ultima_Entrada"] = df_resultado["Ultima_Entrada"].fillna("")
+    df_resultado["Ultima_Saida"] = df_resultado["Ultima_Saida"].fillna("")
 
-    st.subheader("2. Upload dos Arquivos XML (NF-e e NFC-e)")
-    cnpj_loja = st.text_input(
-        "CNPJ da Loja (opcional — ajuda a distinguir compras de vendas em NF-e modelo 55)",
-        placeholder="Ex: 11.111.111/0001-91 (deixe vazio para considerar NF-e 55 = Entrada e NFC-e 65 = Saída)",
+    # 1. Origem CSV: Qtd Física (= Qtd Inicial) + Total_Entradas - Total_Saidas
+    # 2. Origem Sessão: Qtd Inicial + Total_Entradas - Total_Saidas
+    df_resultado["Saldo_Calculado"] = (
+        df_resultado[col_qtd_inicial] + df_resultado["Total_Entradas"] - df_resultado["Total_Saidas"]
+    )
+    st.session_state["df_xml_consolidado"] = df_resultado
+
+if "df_xml_consolidado" in st.session_state:
+    df_res = st.session_state["df_xml_consolidado"]
+    st.subheader("3. Consolidado de Entradas e Saídas por SKU")
+    st.table(df_res)
+    data_hoje = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    csv_consolidado = df_res.to_csv(index=False, sep=";").encode("utf-8-sig")
+    st.download_button(
+        label="📥 Baixar Consolidado de Estoque (.CSV)",
+        data=csv_consolidado,
+        file_name=f"estoque_consolidado_xml_{data_hoje}.csv",
+        mime="text/csv",
+        type="primary",
+        use_container_width=True,
     )
 
-    arquivos_xml = st.file_uploader(
-        "Selecione um ou mais arquivos .XML",
-        type=["xml"],
-        accept_multiple_files=True,
-        key="upload_multiplos_xml",
-    )
-
-    if not arquivos_xml:
-        return
-
-    if st.button("⚙️ Processar XMLs e Gerar Consolidado", type="primary", use_container_width=True):
-        df_base, col_qtd_inicial = _padronizar_colunas_base(df_base, origem=origem_tipo)
-
-        codigos_map = {}
-        for sku_val in df_base["SKU"].astype(str):
-            sku_limpo = sku_val.strip()
-            codigos_map[sku_limpo] = sku_limpo
-            norm = _normalizar_codigo(sku_limpo)
-            if norm:
-                codigos_map[norm] = sku_limpo
-
-        todas_movs = []
-        avisos = []
-
-        with st.spinner(f"Processando {len(arquivos_xml)} arquivo(s) XML..."):
-            for arq in arquivos_xml:
-                movs, erro = processar_arquivo_xml(arq, codigos_map, cnpj_loja)
-                if erro:
-                    avisos.append(erro)
-                todas_movs.extend(movs)
-
-        for aviso in avisos:
-            st.warning(aviso)
-
-        df_movs = pd.DataFrame(todas_movs)
-        df_resultado = df_base.copy()
-
-        for col_antiga in ("Total_Entradas", "Total_Saidas", "Saldo_Calculado"):
-            if col_antiga in df_resultado.columns:
-                df_resultado = df_resultado.drop(columns=[col_antiga])
-
-        if not df_movs.empty:
-            entradas = (
-                df_movs[df_movs["Tipo"] == "Entrada"]
-                .groupby("SKU")["Quantidade"]
-                .sum()
-                .rename("Total_Entradas")
-            )
-            saidas = (
-                df_movs[df_movs["Tipo"] == "Saída"]
-                .groupby("SKU")["Quantidade"]
-                .sum()
-                .rename("Total_Saidas")
-            )
-
-            df_resultado = df_resultado.merge(entradas, on="SKU", how="left")
-            df_resultado = df_resultado.merge(saidas, on="SKU", how="left")
-        else:
-            df_resultado["Total_Entradas"] = 0.0
-            df_resultado["Total_Saidas"] = 0.0
-            st.warning(
-                "Nenhuma movimentação encontrada nos XMLs enviados para os SKUs cadastrados. "
-                "Verifique se o código bipado na coleta corresponde ao <cProd> ou <cEAN> da nota."
-            )
-
-        df_resultado[col_qtd_inicial] = _converter_numero(df_resultado[col_qtd_inicial])
-        df_resultado["Total_Entradas"] = _converter_numero(df_resultado["Total_Entradas"].fillna(0.0))
-        df_resultado["Total_Saidas"] = _converter_numero(df_resultado["Total_Saidas"].fillna(0.0))
-
-        # 1. Origem CSV: Qtd Física (= Qtd Inicial) + Total_Entradas - Total_Saidas
-        # 2. Origem Sessão: Qtd Inicial + Total_Entradas - Total_Saidas
-        df_resultado["Saldo_Calculado"] = (
-            df_resultado[col_qtd_inicial]
-            + df_resultado["Total_Entradas"]
-            - df_resultado["Total_Saidas"]
-        )
-
-        st.session_state["df_xml_consolidado"] = df_resultado
-
-    if "df_xml_consolidado" in st.session_state:
-        df_res = st.session_state["df_xml_consolidado"]
-
-        st.subheader("3. Consolidado de Entradas e Saídas por SKU")
-        st.table(df_res)
-
-        data_hoje = datetime.now().strftime("%Y-%m-%d_%H-%M")
-        csv_consolidado = df_res.to_csv(index=False, sep=";").encode("utf-8-sig")
-
-        st.download_button(
-            label="📥 Baixar Consolidado de Estoque (.CSV)",
-            data=csv_consolidado,
-            file_name=f"estoque_consolidado_xml_{data_hoje}.csv",
-            mime="text/csv",
-            type="primary",
-            use_container_width=True,
-        )
+                
+  
